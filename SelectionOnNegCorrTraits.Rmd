@@ -1,0 +1,198 @@
+---
+title: "Selection on negatively correlated traits"
+author: "Seren Villwock"
+date: "2023-10-24"
+output: html_document
+---
+
+```{r}
+set.seed(14850)
+library(asreml)
+library(tidyverse)
+```
+
+
+#Simulation 1:
+index selection vs trait residuals index
+
+Set up simulation parameters
+```{r}
+popsize <- 200 #n=500 takes a very long time (several minutes) to generate; n=100 was pretty efficient
+sim_length <- 50 #number of generations of selection
+nSelected <- 50
+
+# Define the traits
+means = c(100, 100)
+vars = c(10, 20)
+cors = matrix(data = c( 1.0, -0.3,
+                        -0.3,  1.0),
+              byrow = TRUE, nrow = 2, ncol = 2)
+
+h2s = c(0.5, 0.7)
+```
+
+
+Generate a founder population
+```{r, eval=F}
+founderGen = runMacs(nInd = popsize,
+                     nChr = 18,
+                     segSites = 100)
+SP = SimParam$new(founderGen)
+SP$addTraitA(nQtlPerChr = 100, 
+             mean = means, 
+             var = vars, 
+             corA = cors)
+
+# Create the base population for later selection
+
+# Base population
+basePop = newPop(founderGen)
+
+# Phenotype the population
+basePop = setPheno(basePop, h2 = h2s)
+
+saveRDS(basePop, file="./data/ResidSel_basePop.RDS")
+saveRDS(SP, file="./data/ResidSel_SP.RDS")
+```
+
+Functions for calculating the trait residuals and selection index
+```{r}
+# Extract residuals of association between traits
+CalcStdRes <- function(Y){
+    #Y is a matrix of trait values
+    #fit a linear model
+    trait_rel_mod <- lm(Y[,1] ~ Y[,2])
+    
+    #extract residuals
+    return(trait_rel_mod$residuals)
+}
+
+
+# Extract residuals of association between traits, but alternate the direction of the model
+# depending on which trait has made more gain so far
+CalcStdResFlexible <- function(Y){
+    #Y is a matrix of trait values
+    
+    #decide which trait to prioritize in this generation
+    priority <- mean(scale(Y[,1])) > mean(scale(Y[,2]))
+    
+    #fit a linear model
+    if(priority == T){
+      trait_rel_mod <- lm(Y[,1] ~ Y[,2])} else{
+        trait_rel_mod <- lm(Y[,2] ~ Y[,1])
+      }
+    
+    #extract residuals
+    return(trait_rel_mod$residuals)
+}
+  
+# Incorporate prioritized residuals into a selection index with raw trait values
+CalcStdResIndex <- function(Y, w=c(2,1,1)){
+    #Y is a matrix of trait values
+    
+    #decide which trait to prioritize in this generation
+    priority <- mean(scale(Y[,1])) > mean(scale(Y[,2]))
+    
+    #fit a linear model
+    if(priority == T){
+      trait_rel_mod <- lm(Y[,1] ~ Y[,2])} else{
+        trait_rel_mod <- lm(Y[,2] ~ Y[,1])
+      }
+    
+    #extract residuals
+    resids <- trait_rel_mod$residuals
+    
+    #calculate selection index
+    index <- w[1]*scale(resids) + w[2]*scale(Y[,1]) + w[3]*scale(Y[,2])
+      
+    return(index)
+  }
+```
+
+
+Apply the selection scheme over several generations
+```{r}
+simstore <- data.frame(meanGTrait1=NA, meanGTrait2=NA, sim=NA, generation=NA)
+nsim <- 10 #simulation replicates
+run <- 1
+
+for(i in 1:nsim){
+
+  # Store the results
+  nGenerations = sim_length + 1 # +1 to store starting generation
+  meanG = vector("list", length = nGenerations)
+  varG = vector("list", length = nGenerations)
+  
+  # Save the starting values
+  meanG[[1]] = meanG(basePop)
+  varG[[1]] = varG(basePop)
+  
+  
+  ## First selection step
+  newPopSelected = selectInd(pop = basePop,
+                             nInd = nSelected,
+                             use = "pheno",
+                             trait = CalcStdResIndex,
+                             simParam=SP)
+  
+  # Selection over many generations
+  for (generation in 1:(nGenerations - 1)) {
+    newPop = randCross(newPopSelected, nCrosses = nInd(basePop))
+    newPop = setPheno(newPop, h2 = h2s)
+    newPopSelected = selectInd(pop = newPop,
+                               nInd = nSelected,
+                               use = "pheno",
+                               trait = CalcStdResIndex,
+                               simParam=SP)
+    # Save summaries
+    meanG[[1 + generation]] = meanG(newPop)
+    varG[[1 + generation]] = varG(newPop)
+    
+  }
+  
+  # Plot results
+  meanGTrait1 = sapply(meanG, function(x) x[1])
+  meanGTrait2 = sapply(meanG, function(x) x[2])
+  meanRanges = range(c(meanGTrait1, meanGTrait2))
+  
+  varGTrait1 = sapply(varG, function(x) x[1, 1])
+  varGTrait2 = sapply(varG, function(x) x[2, 2])
+  varRanges = range(c(varGTrait1, varGTrait2))
+  
+  # Plot mean of genetic values over time
+  plot(x = 1:nGenerations, y = meanGTrait1, type = "l", col = "blue", lwd = 3,
+       xlab = "Generation", ylab = "Mean of genetic values", ylim = meanRanges)
+  lines(x = 1:nGenerations, y = meanGTrait2, type = "l", col = "blue", lty = 3, lwd = 3)
+  legend(x = "topleft", legend = c("1", "2"), title = "Trait",
+         lwd = 3, lty = c(1, 3), col = c("blue", "blue"))
+  
+  
+  
+  simstore <- rbind(simstore, cbind(meanGTrait1, meanGTrait2, sim=rep(run, length(meanGTrait2)), generation=1:nGenerations))
+  
+  print(paste0("sim run ", i, "done"))
+  run <- run + 1
+  
+}
+
+timestamp <- format(Sys.time(), "%Y-%m-%d_%H:%M")
+saveRDS(simstore, file=paste0("./output/Simulationsrun",timestamp,".RDS"))
+
+simstoresum <- simstore %>% group_by(generation) %>%
+  summarise(avgT1 = mean(meanGTrait1), sdT1 = sd(meanGTrait1),
+            avgT2 = mean(meanGTrait2), sdT2 = sd(meanGTrait2))
+
+
+
+ggplot(simstoresum, aes(generation, avgT1)) +
+  geom_line(linetype = "dashed", color="#01452c") +
+  geom_ribbon(aes(y = avgT1, ymin = avgT1 - sdT1, ymax = avgT1 + sdT1), fill = "#01452c", alpha = .2) +
+  geom_line(aes(generation,avgT2), linetype = "solid", color="#01452c") +
+  geom_ribbon(aes(y = avgT2, ymin = avgT2 - sdT2, ymax = avgT2 + sdT2), fill = "#01452c", alpha = .2) +
+  ylab("mean trait genetic value")
+
+
+ggsave(file=paste0("./output/MTresiduals_selection",timestamp,".jpg"), scale=0.4)
+```
+
+

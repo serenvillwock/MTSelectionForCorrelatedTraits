@@ -1,0 +1,270 @@
+---
+title: "Selection for joint gain on negatively correlated traits"
+author: "Seren Villwock"
+date: "2023-07-14"
+output: html_document
+---
+
+<style>
+pre {
+  overflow-x: auto;
+}
+pre code {
+  word-wrap: normal;
+  white-space: pre;
+}
+</style>
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo=TRUE)
+knitr::opts_chunk$set(message=FALSE)
+knitr::opts_chunk$set(cache=FALSE)
+knitr::opts_chunk$set(tidy=TRUE)
+knitr::opts_chunk$set(results="hold")
+knitr::opts_chunk$set(collapse=TRUE)
+knitr::opts_chunk$set(fig.show="hold")
+knitr::opts_chunk$set(tidy.opts = list(wrap=FALSE))
+
+library(tidyverse)
+library(AlphaSimR)
+library(ggplot2)
+set.seed(14850)
+```
+
+
+Generate a simulated population using `AlphaSimR`.
+
+Simulation parameters are based on a cassava population with negatively correlated traits, dry matter and carotenoid content (color chart), estimated or directly from Rabbi et al. 2017. These parameters are:
+DM & TC additive correlation = -0.2
+DM & TC error correlation = -0.1
+DM & TC means = 24.12, 6.53 (Parkes et al. 2020)
+DM error variance = 41.08 (Parkes 2020 dominance + error variation)
+TC error variance = 4.35
+Number of founders = 200
+Number of progeny = 6
+HistoricalNe = 200
+Segregating sites = 4400 (ICGMC 2015)
+nQTL = 80
+nSNP = 1000
+
+
+
+```{r}
+## Species, trait, and population parameters
+DM_TC_adcorr = -0.2;
+DM_TC_ercorr = -0.1;
+DM_mean =  24.12;
+DM_addvar = 18.44;
+DM_errvar = 41.08;
+TC_mean = 6.53;
+TC_addvar = 1.36;
+TC_errvar = 4.35;
+FounderNum = 200;
+numProgeny = 6
+
+historicalNe <- 200
+nFounders <- FounderNum
+nChr <- 18
+segSites <- 4400
+nQTL <- 80
+nSNP <- 1000
+```
+
+```{r, eval=F}
+## Create founder population & generate traits
+
+founderHaps <- runMacs2(nInd=nFounders, nChr=nChr, segSites=segSites,
+                          Ne=historicalNe)
+
+SP <- SimParam$new(founderHaps)
+
+traitMeans <- c(DM=DM_mean, TC=TC_mean) 
+#DM= dry matter; TC= total carotenoids/g fresh weight
+#From Parkes et al. 2020
+
+# Specify the variance and correlation
+addVar <- c(DM=DM_addvar, TC=TC_addvar) 
+#additive correlation matrix
+addCor <- matrix(c(1, DM_TC_adcorr, DM_TC_adcorr, 1), nrow=2) 
+# Specify the error correlation and calculate the covariance
+errVar <- c(DM=DM_errvar, TC=TC_errvar)
+errCor <- DM_TC_ercorr; errCov <- errCor*prod(sqrt(errVar))
+errCov <- matrix(c(errVar[1], errCov, errCov, errVar[2]), nrow=2) #error covariance matrix
+saveRDS(errCov, "./data/errCov.RDS")
+
+SP$addTraitA(nQtlPerChr=nQTL, mean=traitMeans, var=addVar, corA=addCor)
+SP$addSnpChip(nSnpPerChr=nSNP)
+
+#save
+saveRDS(SP, file="./data/SP.RDS")
+
+# Create a founder population
+founders <- newPop(founderHaps, simParam=SP)
+nProgeny <- numProgeny
+progenyPop <- randCross(founders, nCrosses=nFounders, nProgeny=nProgeny)
+mtPhenos = setPheno(progenyPop,varE=errCov)
+
+#Create a matrix with phenotypes and genotypes
+simdata=cbind(progenyPop@id, mtPhenos@pheno, mtPhenos@gv)
+
+founderdata <- list(mtPhenos, as.data.frame(simdata))
+saveRDS(founderdata, file="./data/founderdata.RDS")
+saveRDS(mtPhenos, file="./data/basepopulation.RDS")
+```
+
+
+Selection on residuals for simultaneous genetic gain 
+```{r}
+basePop = readRDS(file="./data/basepopulation.RDS")
+
+popsize <- 200 
+sim_length <- 50
+nsim <- 100
+run <- 1
+
+
+#Plot the phenotypic and genetic mean through several generations of breeding.
+
+
+allsims <- data.frame(meanGTrait1=NA, meanGTrait2=NA, sim=NA, generation=NA)
+
+for(i in 1:nsim){
+
+  # Store the results
+  nGenerations = sim_length + 1 # +1 to store starting generation
+  meanG = vector("list", length = nGenerations)
+  varG = vector("list", length = nGenerations)
+  
+  # Save the starting values
+  meanG[[1]] = meanG(basePop)
+  varG[[1]] = varG(basePop)
+  
+  
+  
+  ## First selection step
+  
+  # Calculate composite trait to select on
+  CalcStdRes <- function(Y){
+    #Y is a matrix of trait values
+    #fit a linear model
+    trait_rel_mod <- lm(Y[,1] ~ Y[,2])
+    
+    #extract residuals
+    return(trait_rel_mod$residuals)
+  }
+  
+  CalcTraitRatio <- function(Y){
+    #Y is a matrix of trait values
+    ratio <- scale(Y[,1])/scale(Y[,2])
+    return(ratio)
+  }
+  
+  CalcStdResFlexible <- function(Y){
+    #Y is a matrix of trait values
+    
+    #decide which trait to prioritize in this generation
+    priority <- mean(scale(Y[,1])) > mean(scale(Y[,2]))
+    
+    #fit a linear model
+    if(priority == T){
+      trait_rel_mod <- lm(Y[,1] ~ Y[,2])} else{
+        trait_rel_mod <- lm(Y[,2] ~ Y[,1])
+      }
+    
+    #extract residuals
+    return(trait_rel_mod$residuals)
+  }
+  
+  CalcStdResIndex <- function(Y){
+    #Y is a matrix of trait values
+    
+    #decide which trait to prioritize in this generation
+    priority <- mean(scale(Y[,1])) > mean(scale(Y[,2]))
+    
+    #fit a linear model
+    if(priority == T){
+      trait_rel_mod <- lm(Y[,1] ~ Y[,2])} else{
+        trait_rel_mod <- lm(Y[,2] ~ Y[,1])
+      }
+    
+    #extract residuals
+    resids <- trait_rel_mod$residuals
+    
+    #calculate index
+    
+    index <- 2*scale(resids) + 1*scale(Y[,1]) + 1*scale(Y[,2])
+      
+    return(index)
+  }
+  
+  
+  
+  
+  
+  
+  nSelected = 50
+  newPopSelected = selectInd(pop = basePop,
+                             nInd = nSelected,
+                             use = "pheno",
+                             trait = CalcStdResIndex,
+                             simParam=SP)
+  
+  # Selection over many generations
+  for (generation in 1:(nGenerations - 1)) {
+    newPop = randCross(newPopSelected, nCrosses = nInd(basePop))
+    newPop = setPheno(newPop, varE=errCov)
+    newPopSelected = selectInd(pop = newPop,
+                               nInd = nSelected,
+                               use = "pheno",
+                               trait = CalcStdResIndex,
+                               simParam=SP)
+    # Save summaries
+    meanG[[1 + generation]] = meanG(newPop)
+    varG[[1 + generation]] = varG(newPop)
+    
+  }
+  
+  # Save results
+  meanGTrait1 = sapply(meanG, function(x) x[1])
+  meanGTrait2 = sapply(meanG, function(x) x[2])
+  meanRanges = range(c(meanGTrait1, meanGTrait2))
+  
+  varGTrait1 = sapply(varG, function(x) x[1, 1])
+  varGTrait2 = sapply(varG, function(x) x[2, 2])
+  varRanges = range(c(varGTrait1, varGTrait2))
+  
+  allsims <- rbind(allsims, cbind(meanGTrait1, meanGTrait2, sim=rep(run, length(meanGTrait2)), generation=1:nGenerations))
+  
+  print(i)
+  run <- run + 1
+                   
+}
+  
+
+allsims_sum <- allsimsread %>% group_by(sim) %>%
+  mutate(StdT1 = scale(meanGTrait1)) +
+  mutate(StdT2 = scale(meanGTrait2))
+
+summarise()
+saveRDS(allsims, file="./simulationsrun100x.RDS")
+
+ggplot(allsimsread, aes(generation, meanGTrait1)) +
+  geom_point(color="black") +
+  geom_smooth() +
+  geom_point(aes(generation, meanGTrait2), color="orange") +
+  xlab("Generation") +
+  ylab("Scaled mean genetic value")
+
+
+  # Plot mean of genetic values over time
+  plot(x = 1:nGenerations, y = meanGTrait1, type = "l", col = "blue", lwd = 3,
+       xlab = "Generation", ylab = "Mean of genetic values", ylim = meanRanges)
+  lines(x = 1:nGenerations, y = meanGTrait2, type = "l", col = "blue", lty = 3, lwd = 3)
+  legend(x = "topleft", legend = c("1", "2"), title = "Trait",
+         lwd = 3, lty = c(1, 3), col = c("blue", "blue"))
+  
+  
+
+
+```
+
